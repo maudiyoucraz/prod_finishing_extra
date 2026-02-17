@@ -1,0 +1,333 @@
+name: Self Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Можно запускать вручную кнопкой на GitHub
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:13-alpine
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      # 1. Получаем код
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Инициализируем базу данных (таблица countries)
+      - name: Init database
+        run: |
+          PGPASSWORD=password psql -h localhost -U postgres -d postgres -f tests/init-database.sh || \
+          PGPASSWORD=password psql -h localhost -U postgres -d postgres -c "
+            CREATE TABLE IF NOT EXISTS countries (
+              id SERIAL PRIMARY KEY,
+              name TEXT,
+              alpha2 TEXT,
+              alpha3 TEXT,
+              region TEXT
+            );
+          "
+
+      # 3. Собираем Docker образ
+      - name: Build Docker image
+        run: docker build -t pulse-backend ./solution
+
+      # 4. Запускаем приложение
+      - name: Start application
+        run: |
+          docker run -d \
+            --name pulse-app \
+            --network host \
+            -e SERVER_ADDRESS=0.0.0.0:8080 \
+            -e SERVER_PORT=8080 \
+            -e POSTGRES_CONN=postgresql://postgres:password@localhost:5432/postgres \
+            -e POSTGRES_USERNAME=postgres \
+            -e POSTGRES_PASSWORD=password \
+            -e POSTGRES_HOST=localhost \
+            -e POSTGRES_PORT=5432 \
+            -e POSTGRES_DATABASE=postgres \
+            -e RANDOM_SECRET=test-secret-key-123456789abcdefghijklmnopqrstuvwxyz \
+            pulse-backend
+
+      # 5. Ждём запуска (как в реальных тестах - 10 секунд)
+      - name: Wait for app to start
+        run: |
+          echo "Waiting for app..."
+          for i in $(seq 1 20); do
+            if curl -s http://localhost:8080/api/ping | grep -q "ok"; then
+              echo "✅ App is ready!"
+              break
+            fi
+            echo "Attempt $i/20..."
+            sleep 1
+          done
+
+      # 6. Тесты: Group 01 - Ping
+      - name: "Test 01/ping"
+        run: |
+          echo "=== Testing ping ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/ping)
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ PASS: GET /api/ping returned 200"
+          else
+            echo "❌ FAIL: GET /api/ping returned $STATUS"
+            exit 1
+          fi
+
+      # 7. Тесты: Group 02 - Countries
+      - name: "Test 02/countries - Get all"
+        run: |
+          echo "=== Testing GET /api/countries ==="
+          RESPONSE=$(curl -s http://localhost:8080/api/countries)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries)
+          
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ PASS: Status 200"
+          else
+            echo "❌ FAIL: Status $STATUS"
+            exit 1
+          fi
+          
+          # Проверяем что вернулся массив
+          if echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); assert isinstance(data, list), 'Not a list'"; then
+            echo "✅ PASS: Response is array"
+          else
+            echo "❌ FAIL: Response is not array"
+            exit 1
+          fi
+          
+          # Проверяем сортировку по alpha2
+          if echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          codes = [c['alpha2'] for c in data]
+          assert codes == sorted(codes), f'Not sorted: {codes[:5]}'
+          print(f'Countries count: {len(data)}')
+          "; then
+            echo "✅ PASS: Sorted by alpha2"
+          else
+            echo "❌ FAIL: Not sorted by alpha2"
+            exit 1
+          fi
+
+      - name: "Test 02/countries - Filter by region"
+        run: |
+          echo "=== Testing GET /api/countries?region=Europe ==="
+          RESPONSE=$(curl -s "http://localhost:8080/api/countries?region=Europe")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/countries?region=Europe")
+          
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ PASS: Status 200"
+          else
+            echo "❌ FAIL: Status $STATUS"
+            exit 1
+          fi
+          
+          if echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          regions = set(c.get('region') for c in data)
+          assert regions == {'Europe'}, f'Wrong regions: {regions}'
+          print(f'Europe countries: {len(data)}')
+          "; then
+            echo "✅ PASS: Only Europe countries returned"
+          else
+            echo "❌ FAIL: Wrong regions in response"
+            exit 1
+          fi
+
+      - name: "Test 02/countries - Invalid region returns 400"
+        run: |
+          echo "=== Testing invalid region ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/countries?region=InvalidRegion")
+          
+          if [ "$STATUS" = "400" ]; then
+            echo "✅ PASS: Invalid region returns 400"
+          else
+            echo "❌ FAIL: Invalid region returned $STATUS (expected 400)"
+            exit 1
+          fi
+
+      - name: "Test 02/countries - Get by alpha2"
+        run: |
+          echo "=== Testing GET /api/countries/RU ==="
+          RESPONSE=$(curl -s http://localhost:8080/api/countries/RU)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries/RU)
+          
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ PASS: Status 200"
+          else
+            echo "❌ FAIL: Status $STATUS"
+            exit 1
+          fi
+          
+          if echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['alpha2'] == 'RU', f'Wrong alpha2: {data}'
+          print(f'Found: {data[\"name\"]}')
+          "; then
+            echo "✅ PASS: Correct country returned"
+          else
+            echo "❌ FAIL: Wrong country data"
+            exit 1
+          fi
+
+      - name: "Test 02/countries - Unknown alpha2 returns 404"
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries/XX)
+          if [ "$STATUS" = "404" ]; then
+            echo "✅ PASS: Unknown country returns 404"
+          else
+            echo "❌ FAIL: Unknown country returned $STATUS (expected 404)"
+            exit 1
+          fi
+
+      # 8. Тесты: Group 03 - Register
+      - name: "Test 03/auth/register - Success"
+        run: |
+          echo "=== Testing POST /api/auth/register ==="
+          RESPONSE=$(curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{
+              "login": "testuser",
+              "email": "test@example.com",
+              "password": "Test123pass",
+              "countryCode": "RU",
+              "isPublic": true
+            }')
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{
+              "login": "testuser2",
+              "email": "test2@example.com",
+              "password": "Test123pass",
+              "countryCode": "RU",
+              "isPublic": true
+            }')
+          
+          echo "First register response: $RESPONSE"
+          
+          if echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'profile' in data, f'No profile in response: {data}'
+          profile = data['profile']
+          assert 'login' in profile, 'No login in profile'
+          assert 'email' in profile, 'No email in profile'
+          print(f'Registered: {profile[\"login\"]}')
+          "; then
+            echo "✅ PASS: Registration successful with profile response"
+          else
+            echo "❌ FAIL: Wrong response format"
+            exit 1
+          fi
+
+      - name: "Test 03/auth/register - Duplicate returns 409"
+        run: |
+          # Регистрируем пользователя
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"dupuser","email":"dup@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
+          
+          # Пробуем зарегистрировать снова с тем же логином
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"dupuser","email":"dup2@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}')
+          
+          if [ "$STATUS" = "409" ]; then
+            echo "✅ PASS: Duplicate login returns 409"
+          else
+            echo "❌ FAIL: Duplicate login returned $STATUS (expected 409)"
+            exit 1
+          fi
+
+      - name: "Test 03/auth/register - Weak password returns 400"
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"weakuser","email":"weak@example.com","password":"weak","countryCode":"RU","isPublic":true}')
+          
+          if [ "$STATUS" = "400" ]; then
+            echo "✅ PASS: Weak password returns 400"
+          else
+            echo "❌ FAIL: Weak password returned $STATUS (expected 400)"
+            exit 1
+          fi
+
+      # 9. Тесты: Group 04 - Sign-in
+      - name: "Test 04/auth/sign-in - Success"
+        run: |
+          # Сначала регистрируем
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"signinuser","email":"signin@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
+          
+          # Входим
+          RESPONSE=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"signinuser","password":"Test123pass"}')
+          
+          echo "Sign-in response: $RESPONSE"
+          
+          if echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'token' in data, f'No token in response: {data}'
+          assert len(data['token']) >= 20, 'Token too short'
+          print(f'Token received (length: {len(data[\"token\"])})')
+          "; then
+            echo "✅ PASS: Sign-in successful with token"
+          else
+            echo "❌ FAIL: Wrong sign-in response"
+            exit 1
+          fi
+
+      - name: "Test 04/auth/sign-in - Wrong password returns 401"
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"signinuser","password":"WrongPassword"}')
+          
+          if [ "$STATUS" = "401" ]; then
+            echo "✅ PASS: Wrong password returns 401"
+          else
+            echo "❌ FAIL: Wrong password returned $STATUS (expected 401)"
+            exit 1
+          fi
+
+      # 10. Итоги
+      - name: "📊 Test Summary"
+        run: |
+          echo ""
+          echo "================================"
+          echo "     TEST RESULTS SUMMARY"
+          echo "================================"
+          echo "✅ 01/ping          - PASS (1 point)"
+          echo "✅ 02/countries     - PASS (6 points)"
+          echo "✅ 03/auth/register - PASS (6 points)"
+          echo "✅ 04/auth/sign-in  - PASS (7 points)"
+          echo "--------------------------------"
+          echo "   TOTAL: 20/100 points"
+          echo "================================"
+
+      # 11. Логи в случае ошибок
+      - name: Show app logs on failure
+        if: failure()
+        run: docker logs pulse-app
