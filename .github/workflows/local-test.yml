@@ -3,7 +3,7 @@ name: Self Test
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:  # Можно запускать вручную кнопкой на GitHub
+  workflow_dispatch:
 
 jobs:
   test:
@@ -26,23 +26,22 @@ jobs:
           --health-retries 10
 
     steps:
-      # 1. Получаем код
+      # 1. Получаем код БЕЗ actions/checkout (используем git напрямую)
       - name: Checkout code
-        uses: actions/checkout@v4
+        run: |
+          git clone https://github.com/${{ github.repository }}.git .
+          git checkout ${{ github.sha }}
 
-      # 2. Инициализируем базу данных (таблица countries)
+      # 2. Инициализируем базу данных
       - name: Init database
         run: |
-          PGPASSWORD=password psql -h localhost -U postgres -d postgres -f tests/init-database.sh || \
-          PGPASSWORD=password psql -h localhost -U postgres -d postgres -c "
-            CREATE TABLE IF NOT EXISTS countries (
-              id SERIAL PRIMARY KEY,
-              name TEXT,
-              alpha2 TEXT,
-              alpha3 TEXT,
-              region TEXT
-            );
-          "
+          # Используем скрипт из репозитория
+          export POSTGRES_USER=postgres
+          export POSTGRES_DB=postgres
+          export PGPASSWORD=password
+          
+          # Выполняем SQL из init-database.sh
+          psql -h localhost -U postgres -d postgres -f tests/init-database.sh
 
       # 3. Собираем Docker образ
       - name: Build Docker image
@@ -65,269 +64,157 @@ jobs:
             -e RANDOM_SECRET=test-secret-key-123456789abcdefghijklmnopqrstuvwxyz \
             pulse-backend
 
-      # 5. Ждём запуска (как в реальных тестах - 10 секунд)
+      # 5. Ждём запуска
       - name: Wait for app to start
         run: |
           echo "Waiting for app..."
-          for i in $(seq 1 20); do
-            if curl -s http://localhost:8080/api/ping | grep -q "ok"; then
-              echo "✅ App is ready!"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/api/ping > /dev/null 2>&1; then
+              echo "✅ App is ready after ${i}s!"
               break
             fi
-            echo "Attempt $i/20..."
+            echo "Attempt $i/30..."
             sleep 1
           done
 
-      # 6. Тесты: Group 01 - Ping
-      - name: "Test 01/ping"
+      # 6. Test 01/ping
+      - name: "✅ Test 01/ping"
         run: |
-          echo "=== Testing ping ==="
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/ping)
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ PASS: GET /api/ping returned 200"
-          else
-            echo "❌ FAIL: GET /api/ping returned $STATUS"
-            exit 1
-          fi
+          echo "Status: $STATUS"
+          [ "$STATUS" = "200" ] && echo "✅ PASS: ping OK" || (echo "❌ FAIL: ping returned $STATUS" && exit 1)
 
-      # 7. Тесты: Group 02 - Countries
-      - name: "Test 02/countries - Get all"
+      # 7. Test 02/countries
+      - name: "✅ Test 02/countries - all"
         run: |
-          echo "=== Testing GET /api/countries ==="
-          RESPONSE=$(curl -s http://localhost:8080/api/countries)
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries)
-          
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ PASS: Status 200"
-          else
-            echo "❌ FAIL: Status $STATUS"
-            exit 1
-          fi
-          
-          # Проверяем что вернулся массив
-          if echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); assert isinstance(data, list), 'Not a list'"; then
-            echo "✅ PASS: Response is array"
-          else
-            echo "❌ FAIL: Response is not array"
-            exit 1
-          fi
-          
-          # Проверяем сортировку по alpha2
-          if echo "$RESPONSE" | python3 -c "
+          BODY=$(curl -s http://localhost:8080/api/countries)
+          echo "Status: $STATUS"
+          echo "Body: $BODY"
+          [ "$STATUS" = "200" ] && echo "✅ PASS" || (echo "❌ FAIL: $STATUS" && exit 1)
+          echo "$BODY" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
+          assert isinstance(data, list), 'Not a list'
           codes = [c['alpha2'] for c in data]
-          assert codes == sorted(codes), f'Not sorted: {codes[:5]}'
-          print(f'Countries count: {len(data)}')
-          "; then
-            echo "✅ PASS: Sorted by alpha2"
-          else
-            echo "❌ FAIL: Not sorted by alpha2"
-            exit 1
-          fi
+          assert codes == sorted(codes), f'Not sorted: {codes}'
+          print(f'✅ PASS: {len(data)} countries, sorted correctly')
+          "
 
-      - name: "Test 02/countries - Filter by region"
+      - name: "✅ Test 02/countries - filter by region"
         run: |
-          echo "=== Testing GET /api/countries?region=Europe ==="
-          RESPONSE=$(curl -s "http://localhost:8080/api/countries?region=Europe")
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/countries?region=Europe")
-          
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ PASS: Status 200"
-          else
-            echo "❌ FAIL: Status $STATUS"
-            exit 1
-          fi
-          
-          if echo "$RESPONSE" | python3 -c "
+          BODY=$(curl -s "http://localhost:8080/api/countries?region=Europe")
+          [ "$STATUS" = "200" ] && echo "✅ Status OK" || (echo "❌ FAIL: $STATUS" && exit 1)
+          echo "$BODY" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           regions = set(c.get('region') for c in data)
           assert regions == {'Europe'}, f'Wrong regions: {regions}'
-          print(f'Europe countries: {len(data)}')
-          "; then
-            echo "✅ PASS: Only Europe countries returned"
-          else
-            echo "❌ FAIL: Wrong regions in response"
-            exit 1
-          fi
+          print(f'✅ PASS: {len(data)} European countries')
+          "
 
-      - name: "Test 02/countries - Invalid region returns 400"
+      - name: "✅ Test 02/countries - invalid region = 400"
         run: |
-          echo "=== Testing invalid region ==="
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/countries?region=InvalidRegion")
-          
-          if [ "$STATUS" = "400" ]; then
-            echo "✅ PASS: Invalid region returns 400"
-          else
-            echo "❌ FAIL: Invalid region returned $STATUS (expected 400)"
-            exit 1
-          fi
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/countries?region=INVALID")
+          [ "$STATUS" = "400" ] && echo "✅ PASS: 400 for invalid region" || (echo "❌ FAIL: Got $STATUS, expected 400" && exit 1)
 
-      - name: "Test 02/countries - Get by alpha2"
+      - name: "✅ Test 02/countries - by alpha2"
         run: |
-          echo "=== Testing GET /api/countries/RU ==="
-          RESPONSE=$(curl -s http://localhost:8080/api/countries/RU)
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries/RU)
-          
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ PASS: Status 200"
-          else
-            echo "❌ FAIL: Status $STATUS"
-            exit 1
-          fi
-          
-          if echo "$RESPONSE" | python3 -c "
+          BODY=$(curl -s http://localhost:8080/api/countries/RU)
+          echo "Body: $BODY"
+          [ "$STATUS" = "200" ] && echo "✅ Status OK" || (echo "❌ FAIL: $STATUS" && exit 1)
+          echo "$BODY" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
-          assert data['alpha2'] == 'RU', f'Wrong alpha2: {data}'
-          print(f'Found: {data[\"name\"]}')
-          "; then
-            echo "✅ PASS: Correct country returned"
-          else
-            echo "❌ FAIL: Wrong country data"
-            exit 1
-          fi
+          assert data['alpha2'] == 'RU', f'Wrong country: {data}'
+          print(f'✅ PASS: Found {data[\"name\"]}')
+          "
 
-      - name: "Test 02/countries - Unknown alpha2 returns 404"
+      - name: "✅ Test 02/countries - unknown alpha2 = 404"
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/countries/XX)
-          if [ "$STATUS" = "404" ]; then
-            echo "✅ PASS: Unknown country returns 404"
-          else
-            echo "❌ FAIL: Unknown country returned $STATUS (expected 404)"
-            exit 1
-          fi
+          [ "$STATUS" = "404" ] && echo "✅ PASS: 404 for unknown country" || (echo "❌ FAIL: Got $STATUS, expected 404" && exit 1)
 
-      # 8. Тесты: Group 03 - Register
-      - name: "Test 03/auth/register - Success"
+      # 8. Test 03/auth/register
+      - name: "✅ Test 03/register - success = 201"
         run: |
-          echo "=== Testing POST /api/auth/register ==="
-          RESPONSE=$(curl -s -X POST http://localhost:8080/api/auth/register \
+          BODY=$(curl -s -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
-            -d '{
-              "login": "testuser",
-              "email": "test@example.com",
-              "password": "Test123pass",
-              "countryCode": "RU",
-              "isPublic": true
-            }')
+            -d '{"login":"testuser","email":"test@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}')
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
-            -d '{
-              "login": "testuser2",
-              "email": "test2@example.com",
-              "password": "Test123pass",
-              "countryCode": "RU",
-              "isPublic": true
-            }')
-          
-          echo "First register response: $RESPONSE"
-          
-          if echo "$RESPONSE" | python3 -c "
+            -d '{"login":"testuser2","email":"test2@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}')
+          echo "Register response: $BODY"
+          echo "$BODY" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
-          assert 'profile' in data, f'No profile in response: {data}'
-          profile = data['profile']
-          assert 'login' in profile, 'No login in profile'
-          assert 'email' in profile, 'No email in profile'
-          print(f'Registered: {profile[\"login\"]}')
-          "; then
-            echo "✅ PASS: Registration successful with profile response"
-          else
-            echo "❌ FAIL: Wrong response format"
-            exit 1
-          fi
+          assert 'profile' in data, f'No profile: {data}'
+          p = data['profile']
+          for f in ['login','email','countryCode','isPublic']:
+              assert f in p, f'Missing field: {f}'
+          print(f'✅ PASS: User {p[\"login\"]} registered')
+          "
 
-      - name: "Test 03/auth/register - Duplicate returns 409"
+      - name: "✅ Test 03/register - duplicate = 409"
         run: |
-          # Регистрируем пользователя
           curl -s -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
             -d '{"login":"dupuser","email":"dup@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
-          
-          # Пробуем зарегистрировать снова с тем же логином
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
             -d '{"login":"dupuser","email":"dup2@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}')
-          
-          if [ "$STATUS" = "409" ]; then
-            echo "✅ PASS: Duplicate login returns 409"
-          else
-            echo "❌ FAIL: Duplicate login returned $STATUS (expected 409)"
-            exit 1
-          fi
+          [ "$STATUS" = "409" ] && echo "✅ PASS: 409 for duplicate" || (echo "❌ FAIL: Got $STATUS, expected 409" && exit 1)
 
-      - name: "Test 03/auth/register - Weak password returns 400"
+      - name: "✅ Test 03/register - weak password = 400"
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
             -d '{"login":"weakuser","email":"weak@example.com","password":"weak","countryCode":"RU","isPublic":true}')
-          
-          if [ "$STATUS" = "400" ]; then
-            echo "✅ PASS: Weak password returns 400"
-          else
-            echo "❌ FAIL: Weak password returned $STATUS (expected 400)"
-            exit 1
-          fi
+          [ "$STATUS" = "400" ] && echo "✅ PASS: 400 for weak password" || (echo "❌ FAIL: Got $STATUS, expected 400" && exit 1)
 
-      # 9. Тесты: Group 04 - Sign-in
-      - name: "Test 04/auth/sign-in - Success"
+      # 9. Test 04/auth/sign-in
+      - name: "✅ Test 04/sign-in - success = 200 + token"
         run: |
-          # Сначала регистрируем
           curl -s -X POST http://localhost:8080/api/auth/register \
             -H "Content-Type: application/json" \
             -d '{"login":"signinuser","email":"signin@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
-          
-          # Входим
-          RESPONSE=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+          BODY=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
             -H "Content-Type: application/json" \
             -d '{"login":"signinuser","password":"Test123pass"}')
-          
-          echo "Sign-in response: $RESPONSE"
-          
-          if echo "$RESPONSE" | python3 -c "
+          echo "Sign-in response: $BODY"
+          echo "$BODY" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
-          assert 'token' in data, f'No token in response: {data}'
+          assert 'token' in data, f'No token: {data}'
           assert len(data['token']) >= 20, 'Token too short'
-          print(f'Token received (length: {len(data[\"token\"])})')
-          "; then
-            echo "✅ PASS: Sign-in successful with token"
-          else
-            echo "❌ FAIL: Wrong sign-in response"
-            exit 1
-          fi
+          print(f'✅ PASS: Token received (len={len(data[\"token\"])})')
+          "
 
-      - name: "Test 04/auth/sign-in - Wrong password returns 401"
+      - name: "✅ Test 04/sign-in - wrong password = 401"
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/sign-in \
             -H "Content-Type: application/json" \
-            -d '{"login":"signinuser","password":"WrongPassword"}')
-          
-          if [ "$STATUS" = "401" ]; then
-            echo "✅ PASS: Wrong password returns 401"
-          else
-            echo "❌ FAIL: Wrong password returned $STATUS (expected 401)"
-            exit 1
-          fi
+            -d '{"login":"signinuser","password":"WrongPass"}')
+          [ "$STATUS" = "401" ] && echo "✅ PASS: 401 for wrong password" || (echo "❌ FAIL: Got $STATUS, expected 401" && exit 1)
 
-      # 10. Итоги
-      - name: "📊 Test Summary"
+      # 10. Summary
+      - name: "📊 Summary"
         run: |
           echo ""
-          echo "================================"
-          echo "     TEST RESULTS SUMMARY"
-          echo "================================"
-          echo "✅ 01/ping          - PASS (1 point)"
-          echo "✅ 02/countries     - PASS (6 points)"
-          echo "✅ 03/auth/register - PASS (6 points)"
-          echo "✅ 04/auth/sign-in  - PASS (7 points)"
-          echo "--------------------------------"
-          echo "   TOTAL: 20/100 points"
-          echo "================================"
+          echo "=================================="
+          echo "       TEST RESULTS SUMMARY"
+          echo "=================================="
+          echo "  ✅ 01/ping           1 point"
+          echo "  ✅ 02/countries      6 points"
+          echo "  ✅ 03/auth/register  6 points"
+          echo "  ✅ 04/auth/sign-in   7 points"
+          echo "----------------------------------"
+          echo "  TOTAL: 20 / 100 points"
+          echo "=================================="
 
-      # 11. Логи в случае ошибок
+      # 11. Логи при ошибке
       - name: Show app logs on failure
         if: failure()
-        run: docker logs pulse-app
+        run: docker logs pulse-app 2>&1 || true
