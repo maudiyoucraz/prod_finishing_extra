@@ -316,13 +316,230 @@ def update_password(current_user):
     
     try:
         db.session.commit()
-        # ВАЖНО: В реальном приложении здесь нужно инвалидировать все старые токены
-        # Но т.к. мы используем JWT без хранения в БД, это сложно реализовать
-        # Можно добавить поле user.password_changed_at и проверять его в middleware
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"reason": f"Password update failed: {str(e)}"}), 500
+
+# ============================================
+# ROUTES - Step 8: FRIENDS
+# ============================================
+
+@app.route('/api/friends/add', methods=['POST'])
+@require_auth
+def add_friend(current_user):
+    """Add user to friends"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"reason": "Invalid request body"}), 400
+    
+    login = data.get('login')
+    
+    if not login:
+        return jsonify({"reason": "Missing login"}), 400
+    
+    # Найти пользователя
+    friend = User.query.filter_by(login=login).first()
+    
+    if not friend:
+        return jsonify({"reason": "User not found"}), 404
+    
+    # Если добавляем себя - успешный ответ без добавления
+    if friend.id == current_user.id:
+        return jsonify({"status": "ok"}), 200
+    
+    # Добавить в друзья (или обновить дату если уже есть)
+    from services import FriendService
+    FriendService.add_friend(current_user.id, friend.id)
+    
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/api/friends/remove', methods=['POST'])
+@require_auth
+def remove_friend(current_user):
+    """Remove user from friends"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"reason": "Invalid request body"}), 400
+    
+    login = data.get('login')
+    
+    if not login:
+        return jsonify({"reason": "Missing login"}), 400
+    
+    # Найти пользователя
+    friend = User.query.filter_by(login=login).first()
+    
+    if not friend:
+        # Даже если пользователь не найден - успешный ответ
+        return jsonify({"status": "ok"}), 200
+    
+    # Удалить из друзей
+    from services import FriendService
+    FriendService.remove_friend(current_user.id, friend.id)
+    
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/api/friends', methods=['GET'])
+@require_auth
+def get_friends(current_user):
+    """Get list of friends with pagination"""
+    limit = request.args.get('limit', 5, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    # Ограничения по спецификации
+    limit = min(max(limit, 0), 50)
+    offset = max(offset, 0)
+    
+    from services import FriendService
+    friends = FriendService.get_friends(current_user.id, limit=limit, offset=offset)
+    
+    return jsonify(friends), 200
+
+# ============================================
+# ROUTES - Step 9: POSTS
+# ============================================
+
+@app.route('/api/posts/new', methods=['POST'])
+@require_auth
+def create_post(current_user):
+    """Create a new post"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"reason": "Invalid request body"}), 400
+    
+    content = data.get('content')
+    tags = data.get('tags', [])
+    
+    if not content:
+        return jsonify({"reason": "Missing content"}), 400
+    
+    # Валидация
+    if len(content) > 1000:
+        return jsonify({"reason": "Content too long"}), 400
+    
+    if not isinstance(tags, list):
+        return jsonify({"reason": "Tags must be an array"}), 400
+    
+    for tag in tags:
+        if not isinstance(tag, str) or len(tag) > 20:
+            return jsonify({"reason": "Invalid tag format"}), 400
+    
+    # Создать пост
+    from services import PostService
+    post = PostService.create_post(current_user.id, content, tags)
+    
+    return jsonify(post.to_dict()), 200
+
+@app.route('/api/posts/<string:post_id>', methods=['GET'])
+@require_auth
+def get_post(current_user, post_id):
+    """Get post by ID"""
+    from models import Post
+    from services import PostService
+    
+    post = Post.query.get(post_id)
+    
+    if not post:
+        return jsonify({"reason": "Post not found"}), 404
+    
+    # Проверка доступа
+    if not PostService.has_access_to_post(current_user, post):
+        return jsonify({"reason": "Access denied to this post"}), 404
+    
+    return jsonify(post.to_dict()), 200
+
+# ============================================
+# ROUTES - Step 10: FEED
+# ============================================
+
+@app.route('/api/posts/feed/my', methods=['GET'])
+@require_auth
+def get_my_feed(current_user):
+    """Get own posts feed with pagination"""
+    limit = request.args.get('limit', 5, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    limit = min(max(limit, 0), 50)
+    offset = max(offset, 0)
+    
+    from services import PostService
+    posts = PostService.get_feed(current_user.id, limit=limit, offset=offset)
+    
+    return jsonify(posts), 200
+
+@app.route('/api/posts/feed/<string:login>', methods=['GET'])
+@require_auth
+def get_user_feed(current_user, login):
+    """Get user's posts feed with pagination"""
+    limit = request.args.get('limit', 5, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    limit = min(max(limit, 0), 50)
+    offset = max(offset, 0)
+    
+    from services import PostService
+    posts = PostService.get_user_feed(current_user, login, limit=limit, offset=offset)
+    
+    if posts is None:
+        return jsonify({"reason": "User not found or access denied"}), 404
+    
+    return jsonify(posts), 200
+
+# ============================================
+# ROUTES - Step 11: LIKES
+# ============================================
+
+@app.route('/api/posts/<string:post_id>/like', methods=['POST'])
+@require_auth
+def like_post(current_user, post_id):
+    """Like a post"""
+    from models import Post
+    from services import PostService
+    
+    post = Post.query.get(post_id)
+    
+    if not post:
+        return jsonify({"reason": "Post not found"}), 404
+    
+    # Проверка доступа
+    if not PostService.has_access_to_post(current_user, post):
+        return jsonify({"reason": "Access denied to this post"}), 404
+    
+    # Добавить/обновить лайк
+    PostService.update_reaction(current_user.id, post_id, 'like')
+    
+    # Обновить пост из БД (счётчики обновились)
+    db.session.refresh(post)
+    
+    return jsonify(post.to_dict()), 200
+
+@app.route('/api/posts/<string:post_id>/dislike', methods=['POST'])
+@require_auth
+def dislike_post(current_user, post_id):
+    """Dislike a post"""
+    from models import Post
+    from services import PostService
+    
+    post = Post.query.get(post_id)
+    
+    if not post:
+        return jsonify({"reason": "Post not found"}), 404
+    
+    # Проверка доступа
+    if not PostService.has_access_to_post(current_user, post):
+        return jsonify({"reason": "Access denied to this post"}), 404
+    
+    # Добавить/обновить дизлайк
+    PostService.update_reaction(current_user.id, post_id, 'dislike')
+    
+    # Обновить пост из БД
+    db.session.refresh(post)
+    
+    return jsonify(post.to_dict()), 200
 
 # ============================================
 # MAIN
