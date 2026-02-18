@@ -226,22 +226,433 @@ jobs:
             -d '{"login":"signinuser","password":"WrongPass"}')
           [ "$STATUS" = "401" ] && echo "✅ PASS: 401 for wrong password" || (echo "❌ FAIL: Got $STATUS, expected 401" && exit 1)
 
-      # 10. Summary
+      # 10. Test 05/me - Get and Update Profile
+      - name: "✅ Test 05/me - GET /api/me/profile"
+        run: |
+          # Регистрируем пользователя
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","email":"profile@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
+          
+          # Получаем токен
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # Получаем профиль
+          BODY=$(curl -s http://localhost:8080/api/me/profile -H "Authorization: Bearer $TOKEN")
+          echo "Profile: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'profile' in data, 'No profile in response'
+          p = data['profile']
+          assert p['login'] == 'profileuser', 'Wrong login'
+          assert p['email'] == 'profile@example.com', 'Email should be included for own profile'
+          print('✅ PASS: Own profile with email')
+          "
+
+      - name: "✅ Test 05/me - PATCH /api/me/profile"
+        run: |
+          # Получаем токен
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # Обновляем профиль
+          BODY=$(curl -s -X PATCH http://localhost:8080/api/me/profile \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"isPublic":false,"phone":"+79991234567","image":"https://example.com/avatar.jpg"}')
+          
+          echo "Updated profile: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          p = data['profile']
+          assert p['isPublic'] == False, 'isPublic not updated'
+          assert p['phone'] == '+79991234567', 'Phone not updated'
+          assert p['image'] == 'https://example.com/avatar.jpg', 'Image not updated'
+          print('✅ PASS: Profile updated')
+          "
+
+      - name: "✅ Test 05/me - PATCH empty body = 200"
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH http://localhost:8080/api/me/profile \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          
+          [ "$STATUS" = "200" ] && echo "✅ PASS: Empty PATCH returns 200" || (echo "❌ FAIL: Got $STATUS" && exit 1)
+
+      # 11. Test 06/profiles - Get Profile by Login
+      - name: "✅ Test 06/profiles - public profile accessible"
+        run: |
+          # Создаём пользователя с публичным профилем
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"publicuser","email":"public@example.com","password":"Test123pass","countryCode":"RU","isPublic":true}' > /dev/null
+          
+          # Другой пользователь получает токен
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # Получаем публичный профиль
+          BODY=$(curl -s http://localhost:8080/api/profiles/publicuser -H "Authorization: Bearer $TOKEN")
+          echo "Public profile: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          p = data['profile']
+          assert p['login'] == 'publicuser', 'Wrong user'
+          assert 'email' not in p, 'Email should NOT be in other user profile'
+          print('✅ PASS: Public profile accessible, no email exposed')
+          "
+
+      - name: "✅ Test 06/profiles - private profile not accessible = 403"
+        run: |
+          # Создаём пользователя с закрытым профилем
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"privateuser","email":"private@example.com","password":"Test123pass","countryCode":"RU","isPublic":false}' > /dev/null
+          
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/profiles/privateuser -H "Authorization: Bearer $TOKEN")
+          
+          [ "$STATUS" = "403" ] && echo "✅ PASS: Private profile returns 403" || (echo "❌ FAIL: Got $STATUS, expected 403" && exit 1)
+
+      - name: "✅ Test 06/profiles - unknown user = 403"
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/profiles/nonexistent -H "Authorization: Bearer $TOKEN")
+          
+          [ "$STATUS" = "403" ] && echo "✅ PASS: Unknown user returns 403" || (echo "❌ FAIL: Got $STATUS, expected 403" && exit 1)
+
+      # 12. Test 07/password - Update Password
+      - name: "✅ Test 07/password - success"
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s -X POST http://localhost:8080/api/me/updatePassword \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"oldPassword":"Test123pass","newPassword":"NewPass123"}')
+          
+          echo "Password update: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data.get('status') == 'ok', f'Wrong status: {data}'
+          print('✅ PASS: Password updated')
+          "
+          
+          # Проверяем что старый пароль не работает
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"Test123pass"}')
+          
+          [ "$STATUS" = "401" ] && echo "✅ PASS: Old password rejected" || (echo "❌ FAIL: Old password still works" && exit 1)
+          
+          # Проверяем что новый пароль работает
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"NewPass123"}')
+          
+          [ "$STATUS" = "200" ] && echo "✅ PASS: New password works" || (echo "❌ FAIL: New password doesn't work" && exit 1)
+
+      - name: "✅ Test 07/password - wrong old password = 403"
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"NewPass123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/me/updatePassword \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"oldPassword":"WrongOldPass","newPassword":"AnotherPass123"}')
+          
+          [ "$STATUS" = "403" ] && echo "✅ PASS: Wrong old password returns 403" || (echo "❌ FAIL: Got $STATUS, expected 403" && exit 1)
+
+      - name: "✅ Test 07/password - weak new password = 400"
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"profileuser","password":"NewPass123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/api/me/updatePassword \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"oldPassword":"NewPass123","newPassword":"weak"}')
+          
+          [ "$STATUS" = "400" ] && echo "✅ PASS: Weak password returns 400" || (echo "❌ FAIL: Got $STATUS, expected 400" && exit 1)
+
+      # 13. Test 08/friends
+      - name: "✅ Test 08/friends - add friend"
+        run: |
+          # Создаём двух пользователей
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","email":"user1@example.com","password":"Test123pass","countryCode":"RU","isPublic":false}' > /dev/null
+          curl -s -X POST http://localhost:8080/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2","email":"user2@example.com","password":"Test123pass","countryCode":"RU","isPublic":false}' > /dev/null
+          
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # Добавить в друзья
+          BODY=$(curl -s -X POST http://localhost:8080/api/friends/add \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2"}')
+          
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data.get('status') == 'ok', f'Wrong status: {data}'
+          print('✅ PASS: Friend added')
+          "
+
+      - name: "✅ Test 08/friends - list friends"
+        run: |
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s http://localhost:8080/api/friends -H "Authorization: Bearer $TOKEN1")
+          echo "Friends list: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert isinstance(data, list), 'Not a list'
+          assert len(data) >= 1, 'Friend not in list'
+          assert data[0]['login'] == 'user2', f'Wrong friend: {data[0]}'
+          assert 'addedAt' in data[0], 'Missing addedAt'
+          print('✅ PASS: Friends list correct')
+          "
+
+      - name: "✅ Test 08/friends - remove friend"
+        run: |
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s -X POST http://localhost:8080/api/friends/remove \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2"}')
+          
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data.get('status') == 'ok', f'Wrong status: {data}'
+          print('✅ PASS: Friend removed')
+          "
+
+      # 14. Test 09/posts - Create and Get Posts
+      - name: "✅ Test 09/posts - create post"
+        run: |
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s -X POST http://localhost:8080/api/posts/new \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"My first post!","tags":["test","demo"]}')
+          
+          echo "Created post: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'id' in data, 'Missing post ID'
+          assert data['content'] == 'My first post!', 'Wrong content'
+          assert data['author'] == 'user1', 'Wrong author'
+          assert data['tags'] == ['test', 'demo'], 'Wrong tags'
+          assert 'createdAt' in data, 'Missing createdAt'
+          assert data['likesCount'] == 0, 'Likes should be 0'
+          assert data['dislikesCount'] == 0, 'Dislikes should be 0'
+          print(f'Post ID: {data[\"id\"]}')
+          with open('/tmp/post_id.txt', 'w') as f:
+              f.write(data['id'])
+          print('✅ PASS: Post created')
+          "
+
+      - name: "✅ Test 09/posts - get post by ID"
+        run: |
+          POST_ID=$(cat /tmp/post_id.txt)
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s http://localhost:8080/api/posts/$POST_ID -H "Authorization: Bearer $TOKEN1")
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['content'] == 'My first post!', 'Wrong content'
+          print('✅ PASS: Post retrieved by ID')
+          "
+
+      - name: "✅ Test 09/posts - access control (private profile)"
+        run: |
+          POST_ID=$(cat /tmp/post_id.txt)
+          TOKEN2=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # user2 не может видеть пост user1 (приватный профиль, не друзья)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/posts/$POST_ID -H "Authorization: Bearer $TOKEN2")
+          
+          [ "$STATUS" = "404" ] && echo "✅ PASS: Private post hidden from non-friends" || (echo "❌ FAIL: Got $STATUS, expected 404" && exit 1)
+
+      # 15. Test 10/feed
+      - name: "✅ Test 10/feed - my feed"
+        run: |
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # Создаём ещё пост
+          curl -s -X POST http://localhost:8080/api/posts/new \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"Second post","tags":[]}' > /dev/null
+          
+          BODY=$(curl -s "http://localhost:8080/api/posts/feed/my?limit=10" -H "Authorization: Bearer $TOKEN1")
+          echo "My feed: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert isinstance(data, list), 'Not a list'
+          assert len(data) >= 2, f'Should have 2+ posts, got {len(data)}'
+          # Сортировка по дате (новые первые)
+          assert data[0]['content'] == 'Second post', 'Wrong order'
+          print('✅ PASS: My feed correct')
+          "
+
+      - name: "✅ Test 10/feed - user feed with access"
+        run: |
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          TOKEN2=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # user1 добавляет user2 в друзья
+          curl -s -X POST http://localhost:8080/api/friends/add \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2"}' > /dev/null
+          
+          # Теперь user2 может видеть ленту user1
+          BODY=$(curl -s http://localhost:8080/api/posts/feed/user1 -H "Authorization: Bearer $TOKEN2")
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert isinstance(data, list), 'Not a list'
+          assert len(data) >= 2, 'Should see user1 posts'
+          print('✅ PASS: Friend can see private user feed')
+          "
+
+      # 16. Test 11/likes
+      - name: "✅ Test 11/likes - like post"
+        run: |
+          POST_ID=$(cat /tmp/post_id.txt)
+          TOKEN2=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          BODY=$(curl -s -X POST http://localhost:8080/api/posts/$POST_ID/like \
+            -H "Authorization: Bearer $TOKEN2")
+          
+          echo "After like: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['likesCount'] == 1, f'Likes should be 1, got {data[\"likesCount\"]}'
+          assert data['dislikesCount'] == 0, 'Dislikes should be 0'
+          print('✅ PASS: Like counted')
+          "
+
+      - name: "✅ Test 11/likes - dislike post"
+        run: |
+          POST_ID=$(cat /tmp/post_id.txt)
+          TOKEN2=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user2","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # user2 меняет мнение на dislike
+          BODY=$(curl -s -X POST http://localhost:8080/api/posts/$POST_ID/dislike \
+            -H "Authorization: Bearer $TOKEN2")
+          
+          echo "After dislike: $BODY"
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['likesCount'] == 0, 'Likes should be 0 (changed mind)'
+          assert data['dislikesCount'] == 1, f'Dislikes should be 1, got {data[\"dislikesCount\"]}'
+          print('✅ PASS: Dislike replaces like')
+          "
+
+      - name: "✅ Test 11/likes - multiple users"
+        run: |
+          POST_ID=$(cat /tmp/post_id.txt)
+          TOKEN1=$(curl -s -X POST http://localhost:8080/api/auth/sign-in \
+            -H "Content-Type: application/json" \
+            -d '{"login":"user1","password":"Test123pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          
+          # user1 (автор) лайкает свой пост
+          curl -s -X POST http://localhost:8080/api/posts/$POST_ID/like \
+            -H "Authorization: Bearer $TOKEN1" > /dev/null
+          
+          # Проверяем итог: user1=like, user2=dislike
+          BODY=$(curl -s http://localhost:8080/api/posts/$POST_ID -H "Authorization: Bearer $TOKEN1")
+          echo "$BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['likesCount'] == 1, f'Likes should be 1, got {data[\"likesCount\"]}'
+          assert data['dislikesCount'] == 1, f'Dislikes should be 1, got {data[\"dislikesCount\"]}'
+          print('✅ PASS: Multiple users reactions work')
+          "
+
+      # 17. Summary
       - name: "📊 Summary"
         run: |
           echo ""
-          echo "=================================="
+          echo "===================================="
           echo "       TEST RESULTS SUMMARY"
-          echo "=================================="
-          echo "  ✅ 01/ping           1 point"
-          echo "  ✅ 02/countries      6 points"
-          echo "  ✅ 03/auth/register  6 points"
-          echo "  ✅ 04/auth/sign-in   7 points"
-          echo "----------------------------------"
-          echo "  TOTAL: 20 / 100 points"
-          echo "=================================="
+          echo "===================================="
+          echo "  ✅ 01/ping            1 point"
+          echo "  ✅ 02/countries       6 points"
+          echo "  ✅ 03/auth/register   6 points"
+          echo "  ✅ 04/auth/sign-in    7 points"
+          echo "  ✅ 05/me              8 points"
+          echo "  ✅ 06/profiles        5 points"
+          echo "  ✅ 07/password        7 points"
+          echo "  ✅ 08/friends        12 points"
+          echo "  ✅ 09/posts/publish  12 points"
+          echo "  ✅ 10/posts/feed     16 points"
+          echo "  ✅ 11/posts/likes    20 points"
+          echo "------------------------------------"
+          echo "  🎉 TOTAL: 100 / 100 points 🎉"
+          echo "===================================="
 
-      # 11. Логи при ошибке
+      # 18. Логи при ошибке
       - name: Show app logs on failure
         if: failure()
         run: docker logs pulse-app 2>&1 || true
