@@ -205,6 +205,125 @@ def get_me_profile(current_user):
     """Get own profile (requires authentication)"""
     return jsonify({"profile": current_user.to_dict(include_private=True)}), 200
 
+@app.route('/api/me/profile', methods=['PATCH'])
+@require_auth
+def update_me_profile(current_user):
+    """Update own profile (requires authentication)"""
+    data = request.get_json()
+    
+    if not data:
+        # Пустой запрос - ничего не меняем, возвращаем профиль
+        return jsonify({"profile": current_user.to_dict(include_private=True)}), 200
+    
+    # Получаем поля для обновления
+    country_code = data.get('countryCode')
+    is_public = data.get('isPublic')
+    phone = data.get('phone')
+    image = data.get('image')
+    
+    # Валидация countryCode
+    if country_code is not None:
+        if not validate_email(country_code):  # Проверка длины
+            return jsonify({"reason": "Invalid country code format"}), 400
+        country = Country.query.filter_by(alpha2=country_code).first()
+        if not country:
+            return jsonify({"reason": "Country not found"}), 400
+        current_user.country_code = country_code
+    
+    # Валидация и обновление isPublic
+    if is_public is not None:
+        current_user.is_public = is_public
+    
+    # Валидация и обновление phone
+    if phone is not None:
+        if not validate_phone(phone):
+            return jsonify({"reason": "Invalid phone format"}), 400
+        # Проверка уникальности (если phone не пустой)
+        if phone:
+            existing = User.query.filter(User.phone == phone, User.id != current_user.id).first()
+            if existing:
+                return jsonify({"reason": "Phone number already in use"}), 409
+        current_user.phone = phone if phone else None
+    
+    # Валидация и обновление image
+    if image is not None:
+        if not validate_image(image):
+            return jsonify({"reason": "Invalid image URL"}), 400
+        current_user.image = image if image else None
+    
+    try:
+        db.session.commit()
+        return jsonify({"profile": current_user.to_dict(include_private=True)}), 200
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"reason": "Phone number already in use"}), 409
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"reason": f"Update failed: {str(e)}"}), 500
+
+# ============================================
+# ROUTES - Step 5: GET PROFILE BY LOGIN
+# ============================================
+
+@app.route('/api/profiles/<string:login>', methods=['GET'])
+@require_auth
+def get_profile(current_user, login):
+    """Get profile by login (requires authentication)"""
+    # Найти пользователя
+    target_user = User.query.filter_by(login=login).first()
+    
+    if not target_user:
+        return jsonify({"reason": "User not found"}), 403
+    
+    # Проверить доступ к профилю
+    from services import PostService
+    if not PostService.has_access_to_profile(current_user, target_user):
+        return jsonify({"reason": "Access denied to this profile"}), 403
+    
+    # Возвращаем профиль (без email, если это не свой профиль)
+    include_private = (current_user.id == target_user.id)
+    return jsonify({"profile": target_user.to_dict(include_private=include_private)}), 200
+
+# ============================================
+# ROUTES - Step 6: UPDATE PASSWORD
+# ============================================
+
+@app.route('/api/me/updatePassword', methods=['POST'])
+@require_auth
+def update_password(current_user):
+    """Update password (requires authentication)"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"reason": "Invalid request body"}), 400
+    
+    old_password = data.get('oldPassword')
+    new_password = data.get('newPassword')
+    
+    if not all([old_password, new_password]):
+        return jsonify({"reason": "Missing oldPassword or newPassword"}), 400
+    
+    # Проверка старого пароля
+    if not check_password_hash(current_user.password_hash, old_password):
+        return jsonify({"reason": "Old password is incorrect"}), 403
+    
+    # Валидация нового пароля
+    if not validate_password(new_password):
+        return jsonify({"reason": "New password does not meet requirements"}), 400
+    
+    # Обновление пароля
+    current_user.password_hash = generate_password_hash(new_password)
+    
+    try:
+        db.session.commit()
+        # ВАЖНО: В реальном приложении здесь нужно инвалидировать все старые токены
+        # Но т.к. мы используем JWT без хранения в БД, это сложно реализовать
+        # Можно добавить поле user.password_changed_at и проверять его в middleware
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"reason": f"Password update failed: {str(e)}"}), 500
+
 # ============================================
 # MAIN
 # ============================================
